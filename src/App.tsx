@@ -855,6 +855,78 @@ function WorksheetBuilder({worksheets,setWorksheets,classes,t}:any){
 }
 
 function GradesView({students,classes,topics,subs,t,topicName}:any){
+  // 1. 計算個別學生作品的分數（相容工作紙與一般評核）
+const getSubmissionScore = (sub: Submission) => {
+  if (sub.autoScore !== undefined) return sub.autoScore;
+  if (sub.marks && sub.marks.length) return sub.marks.reduce((a, b) => a + b, 0);
+  return 0;
+};
+
+// 2. 計算某個班別的全班平均分
+const calculateClassAverage = (classId: string) => {
+  const classStudents = students.filter(s => s.classId === classId && s.status !== "withdrawn");
+  const studentIds = classStudents.map(s => s.id);
+  
+  // 找出該班學生的所有最新提交紀錄
+  const validSubs = subs.filter(s => studentIds.includes(s.studentId) && (s.marks?.length || s.autoScore !== undefined));
+  
+  if (!validSubs.length) return "—";
+  
+  const totalScore = validSubs.reduce((acc, sub) => acc + getSubmissionScore(sub), 0);
+  return (totalScore / validSubs.length).toFixed(1);
+};
+
+// 3. 匯出 Excel (CSV) 檔案（內建 UTF-8 防亂碼處理）
+const handleExportCSV = (selectedClassId: string) => {
+  const classStudents = students.filter(s => s.classId === selectedClassId && s.status !== "withdrawn");
+  const classTopics = topics.filter(t => t.classIds.includes(selectedClassId));
+
+  // CSV 標頭：班別, 學號, 姓名, 課題1, 課題2..., 個人平均分
+  let csvContent = "\uFEFF班別,學號,姓名," + classTopics.map(t => `"${t.nameZh}"`).join(",") + ",個人平均分\n";
+
+  let classTotalScore = 0;
+  let classSubCount = 0;
+
+  classStudents.forEach(s => {
+    let studentSum = 0;
+    let studentCount = 0;
+
+    const rowScores = classTopics.map(t => {
+      const sub = subs
+        .filter(x => x.studentId === s.id && x.topicId === t.id)
+        .sort((a, b) => b.version - a.version)[0];
+
+      if (!sub) return "未交";
+
+      const score = getSubmissionScore(sub);
+      studentSum += score;
+      studentCount++;
+      return score;
+    });
+
+    const studentAvg = studentCount > 0 ? (studentSum / studentCount).toFixed(1) : "—";
+    if (studentCount > 0) {
+      classTotalScore += studentSum;
+      classSubCount += studentCount;
+    }
+
+    csvContent += `"${s.classId}","${s.number}","${s.name}",` + rowScores.join(",") + `,"${studentAvg}"\n`;
+  });
+
+  // 底部新增：全班總平均分
+  const classAvg = classSubCount > 0 ? (classTotalScore / classSubCount).toFixed(1) : "—";
+  csvContent += `全班平均分,,,` + classTopics.map(() => "").join(",") + `,"${classAvg}"\n`;
+
+  // 觸發瀏覽器下載檔案
+  const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.setAttribute("download", `${selectedClassId}_班級視覺藝術成績表.csv`);
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+};
   const [classId,setClassId]=useState(classes[0]?.id||"2A"); const [topicId,setTopicId]=useState(topics[0]?.id||"");
   const list=students.filter((s:Student)=>s.classId===classId).sort((a:Student,b:Student)=>Number(a.number)-Number(b.number));
   const rows=list.map((s:Student)=>{const ss=subs.filter((q:Submission)=>q.studentId===s.id&&q.topicId===topicId&&q.status==="assessed");const marks=ss.flatMap((q:Submission)=>q.marks||[]);return {s,total:marks.length?marks.reduce((a,b)=>a+b,0):null}});
@@ -865,3 +937,24 @@ function GradesView({students,classes,topics,subs,t,topicName}:any){
 function Status({status,t}:{status:StudentStatus;t:any}){return <span className={`status-pill ${status}`}>{status==="active"?"🟢 "+t("正常上課","Active"):status==="longAbsence"?"🟡 "+t("暫時長期缺席","Long Absence"):"⚫ "+t("畢業／離校","Graduated / Withdrawn")}</span>}
 function PageTitle({title,sub,action}:any){return <div className="page-title"><div><h1>{title}</h1>{sub&&<p>{sub}</p>}</div>{action&&<div className="page-action">{action}</div>}</div>}
 function Modal({title,onClose,children}:any){return <div className="modal-backdrop"><div className="modal"><div className="modal-head"><h2>{title}</h2><button className="icon-btn" onClick={onClose}><X size={17}/></button></div>{children}</div></div>}
+<div className="class-settings-bar">
+  <div>
+    <h3>{selectedClassId} 班成績總覽</h3>
+    <span>全班人數：{students.filter(s => s.classId === selectedClassId && s.status !== "withdrawn").length} 人</span>
+  </div>
+
+  <div style={{ display: "flex", gap: "16px", alignItems: "center" }}>
+    {/* 全班平均分顯示卡片 */}
+    <div style={{ background: "#f5efff", padding: "8px 16px", borderRadius: "10px", border: "1px solid #d8b4fe" }}>
+      <small style={{ color: "#6b21a8", fontWeight: "bold" }}>全班平均分</small>
+      <div style={{ fontSize: "22px", fontWeight: "800", color: "#581c87" }}>
+        {calculateClassAverage(selectedClassId)} <span style={{ fontSize: "13px" }}>分</span>
+      </div>
+    </div>
+
+    {/* 匯出 CSV 成績單按鈕 */}
+    <button className="primary" onClick={() => handleExportCSV(selectedClassId)}>
+      📥 匯出 {selectedClassId} 班 CSV 成績表
+    </button>
+  </div>
+</div>
