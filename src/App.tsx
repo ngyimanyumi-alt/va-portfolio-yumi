@@ -300,16 +300,55 @@ function getWorksheetForStudent(id: string) {
 
 export default function App(){
   
-  const [lang,setLang]=useState<Lang>("zh");
-  const [role,setRole]=useState<Role|null>(null);
-  const [studentId,setStudentId]=useState<string|null>(null);
-  const [view,setView]=useState<View>("home");
+  const [lang, setLang] = useState<Lang>(() => load("va_lang", "zh"));
+const [role, setRole] = useState<Role | null>(() => load("va_role", null));
+const [studentId, setStudentId] = useState<string | null>(() => load("va_student_id", null));
+const [view, setView] = useState<View>(() => load("va_view", "home"));
   const [students,setStudents]=useState<Student[]>(()=>load("va_students",seedStudents));
   const [classes,setClasses]=useState<ClassItem[]>(()=>load("va_classes",seedClasses));
   const [topics,setTopics]=useState<Topic[]>(()=>load("va_topics",seedTopics));
   const [subs,setSubs]=useState<Submission[]>(()=>load("va_submissions",[]));
   const [worksheets,setWorksheets]=useState<Worksheet[]>(()=>load<any[]>("va_worksheets",[]).map((w:any)=>({...w,questions:rebalanceTo100(w.questions||[])})));
   const [teacherPassword,setTeacherPassword]=useState(TEACHER_PASSWORD);
+  useEffect(() => {
+    const fetchSubmissions = async () => {
+      const { data, error } = await supabase.from('submissions').select('*');
+      if (!error && data) {
+        setSubs(data);
+      }
+    };
+
+    fetchSubmissions();
+
+    const channel = supabase
+      .channel('realtime-submissions')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'submissions' },
+        (payload) => {
+          if (payload.eventType === 'INSERT') {
+            setSubs((prev) => [payload.new as Submission, ...prev]);
+          } else if (payload.eventType === 'UPDATE') {
+            setSubs((prev) =>
+              prev.map((item) => (item.id === payload.new.id ? (payload.new as Submission) : item))
+            );
+          }
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, []);
+  
+  
+  
+  useEffect(() => localStorage.setItem("va_lang", JSON.stringify(lang)), [lang]);
+useEffect(() => localStorage.setItem("va_role", JSON.stringify(role)), [role]);
+useEffect(() => localStorage.setItem("va_student_id", JSON.stringify(studentId)), [studentId]);
+useEffect(() => localStorage.setItem("va_view", JSON.stringify(view)), [view]);
+  
   useEffect(()=>localStorage.setItem("va_students",JSON.stringify(students)),[students]);
   useEffect(()=>localStorage.setItem("va_classes",JSON.stringify(classes)),[classes]);
   useEffect(()=>localStorage.setItem("va_topics",JSON.stringify(topics)),[topics]);
@@ -318,13 +357,14 @@ export default function App(){
   const t=(zh:string,en:string)=>lang==="zh"?zh:en;
   const student=students.find(s=>s.id===studentId);
   const topicName=(x:Topic)=>lang==="zh"?x.nameZh:x.nameEn;
-  const logout=()=>{setRole(null);setStudentId(null);setView("home")};
-  if(!role) return <><style>{V4_STYLES}</style><LoginScreen lang={lang} setLang={setLang} students={students} classes={classes} password={teacherPassword}
-    onStudent={(id,l)=>{setStudentId(id);setLang(l);setRole("student");setView("home")}}
-    onTeacher={(p)=>{if(p===teacherPassword){setRole("teacher");setView("dashboard")} else alert(t("老師密碼不正確","Incorrect teacher password."))}} /></>;
-  if(role==="student" && student) return <><style>{V4_STYLES}</style><StudentApp {...{student,lang,setLang,view,setView,topics,subs,setSubs,classes,worksheets,topicName,t,logout}} /></>;
-  return <><style>{V4_STYLES}</style><TeacherApp {...{lang,setLang,view,setView,students,setStudents,classes,setClasses,topics,setTopics,subs,setSubs,worksheets,setWorksheets,topicName,t,logout}} /></>;
-}
+const logout = () => {
+  setRole(null);
+  setStudentId(null);
+  setView("home");
+  localStorage.removeItem("va_role");
+  localStorage.removeItem("va_student_id");
+  localStorage.removeItem("va_view");
+};}
 
 function LoginScreen({lang,setLang,students,classes,password,onStudent,onTeacher}:{lang:Lang;setLang:(x:Lang)=>void;students:Student[];classes:ClassItem[];password:string;onStudent:(id:string,l:Lang)=>void;onTeacher:(p:string)=>void}){
   const [classId,setClassId]=useState(classes[0]?.id||"2A");
@@ -456,6 +496,7 @@ function StudentWorksheetView({student,myTopics,worksheets,topicName,t,subs,setS
       {ws.questions.map((q:WorksheetQuestion,i:number)=><div className="worksheet-question" key={q.id}><div className="question-head"><b>{i+1}. {q.type==="mc"?t("選擇題","Multiple Choice"):q.type==="fill"?t("填充題","Fill in the Blank"):t("短答題","Short Answer")}</b><span>{q.points} {t("分","pts")}</span></div><h3>{q.question}</h3>{q.questionEn&&<p className="muted">{q.questionEn}</p>}{q.options&&<div className="answer-options">{q.options.map(o=><label key={o.label}><input type="radio" name={q.id} checked={answers[q.id]===o.label} onChange={()=>setAnswers({...answers,[q.id]:o.label})}/><b>{o.label}</b> {o.zh}{o.en?` / ${o.en}`:""}</label>)}</div>}{q.type==="fill"&&<input value={answers[q.id]||""} onChange={e=>setAnswers({...answers,[q.id]:e.target.value})} placeholder={t("輸入答案…","Type your answer…")}/>} {q.type==="short"&&<textarea value={answers[q.id]||""} onChange={e=>setAnswers({...answers,[q.id]:e.target.value})} placeholder={t("請輸入答案…","Type your answer…")}/>}</div>)}<div className="publish-bar"><button className="primary" onClick={submit}>{t("提交工作紙","Submit Worksheet")}</button></div></div></Modal>}
     {reviewSub&&review&&<StudentWorksheetReview ws={review} sub={reviewSub} t={t} onClose={()=>setReviewId(null)}/>}
   </div>;
+  await supabase.from('submissions').upsert(item);
 }
 
 function StudentWorksheetReview({ws,sub,t,onClose}:any){
