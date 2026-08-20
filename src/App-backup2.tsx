@@ -1,10 +1,6 @@
 
+import { supabase } from './supabase';
 // Worksheet Workflow vFinal
-import {
-  normalizeWorksheetQuestions,
-  rebalanceTo100,
-  buildWorksheet
-} from "./worksheet-workflow";
 import React, { useEffect, useMemo, useState } from "react";
 import {
   BookOpen, Camera, Check, ChevronLeft, ChevronRight, Clipboard,
@@ -34,6 +30,7 @@ type Worksheet = {
   titleZh: string;
   titleEn: string;
   classIds: string[];
+  studentIds?: string[];
   dueDate: string;
   questions: WorksheetQuestion[];
   sourceName?: string;
@@ -59,6 +56,7 @@ type Submission = {
   version: number; status: "submitted" | "assessed"; marks?: number[];
   answers?: Record<string,string>; worksheetId?: string; autoScore?: number;
   feedbackGood?: string[]; feedbackImprove?: string[]; comment?: string; assessedAt?: string;
+  teacherChecked?: boolean;
 };
 
 const TEACHER_PASSWORD = "VA2026";
@@ -152,6 +150,53 @@ function load<T>(key:string, fallback:T):T {
 function now(){ return new Date().toISOString(); }
 function dateText(s:string){ return new Date(s).toLocaleDateString("en-GB"); }
 
+/** Normalize raw question data (from paste-import, AI worker, or storage) into this app's
+ *  WorksheetQuestion shape, where options are {label, zh, en?} objects — NOT plain strings.
+ *  Accepts three input shapes for `options`: already-correct object array, a plain string
+ *  array, or a lettered object map like {A:"...",B:"..."} (the AI worker's format). */
+function normalizeQuestions(input:any[]):WorksheetQuestion[]{
+  return (Array.isArray(input)?input:[]).map((q,i)=>{
+    let options:{label:string;zh:string;en?:string}[]|undefined;
+    if(Array.isArray(q?.options)){
+      options=q.options.map((o:any,j:number)=>
+        o&&typeof o==="object"
+          ? {label:String(o.label||String.fromCharCode(65+j)),zh:String(o.zh??o.text??o.value??""),en:o.en?String(o.en):undefined}
+          : {label:String.fromCharCode(65+j),zh:String(o)}
+      ).filter((o:any)=>o.zh.trim());
+    } else if(q?.options&&typeof q.options==="object"){
+      options=Object.keys(q.options).map(label=>({label,zh:String(q.options[label]||"")})).filter(o=>o.zh.trim());
+    }
+    const hasOptions=!!(options&&options.length);
+    const type:WorksheetQuestion["type"]=q?.type==="fill"||q?.type==="short"?q.type:(q?.type==="mc"||hasOptions?"mc":"short");
+    return {
+      id: String(q?.id || `q-${Date.now()}-${i}-${Math.random().toString(36).slice(2,7)}`),
+      type,
+      question: String(q?.question||"").trim(),
+      questionEn: q?.questionEn?String(q.questionEn):undefined,
+      options: type==="mc"?options:undefined,
+      answer: typeof q?.answer==="string"?q.answer:Array.isArray(q?.answer)?q.answer:undefined,
+      acceptedAnswers: Array.isArray(q?.acceptedAnswers)?q.acceptedAnswers.map((x:any)=>String(x)):undefined,
+      explanation: q?.explanation?String(q.explanation):undefined,
+      points: Math.max(1, Number(q?.points)||1),
+    } as WorksheetQuestion;
+  }).filter(q=>q.question);
+}
+
+/** Allocate exactly 100 points across questions, keeping every question at least 1 point. */
+function allocate100(count:number):number[]{
+  const n=Math.max(1,Math.floor(count||1));
+  const base=Math.floor(100/n);
+  const remainder=100-base*n;
+  return Array.from({length:n},(_,i)=>base+(i<remainder?1:0));
+}
+
+function rebalanceTo100(questions:any[]):WorksheetQuestion[]{
+  const clean=normalizeQuestions(questions);
+  if(!clean.length) return [];
+  const points=allocate100(clean.length);
+  return clean.map((q,i)=>({...q,points:points[i]}));
+}
+
 
 const V4_STYLES = `
 .class-tabs{display:flex;gap:10px;flex-wrap:wrap;margin:18px 0 14px}
@@ -185,6 +230,23 @@ const V4_STYLES = `
 .builder-grid{display:grid;grid-template-columns:minmax(280px,.85fr) minmax(360px,1.4fr);gap:18px}.builder-card{background:#fff;border:1px solid #e5e7eb;border-radius:16px;padding:20px;margin-bottom:18px}.builder-card h2{margin-top:0;font-size:18px}.builder-card label{display:block;margin:12px 0 6px;font-weight:600;font-size:13px}.upload-source{display:flex;align-items:center;gap:10px;margin-bottom:10px}.file-button{display:inline-flex!important;align-items:center;gap:7px;padding:9px 12px;border:1px solid #d0d5dd;border-radius:8px;cursor:pointer;background:#fff}.file-button input{display:none}.source-textarea{min-height:360px;font-family:inherit;line-height:1.55}.builder-actions,.publish-bar{display:flex;gap:10px;justify-content:flex-end;align-items:center;margin-top:14px;flex-wrap:wrap}.question-head{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:8px}.worksheet-question{border:1px solid #e4e7ec;border-radius:12px;padding:16px;margin:12px 0}.worksheet-question textarea{min-height:80px}.question-controls{display:flex;gap:14px;align-items:flex-end}.question-controls label{flex:1}.option-editor{margin-top:8px}.option-editor>div{display:flex;gap:8px;margin:7px 0}.option-editor input{flex:1}.answer-toggle{border:1px solid #d0d5dd;background:#fff;border-radius:8px;padding:8px 10px;white-space:nowrap}.answer-toggle.on{background:#eef8f1;border-color:#8bc99d}.publish-bar{border-top:1px solid #eaecf0;padding-top:16px}.muted{color:#667085;font-size:13px;line-height:1.5}
 @media(max-width:900px){.builder-grid{grid-template-columns:1fr}.builder-card{padding:16px}.question-controls{flex-direction:column;align-items:stretch}.question-controls label{width:100%}.builder-actions,.publish-bar{justify-content:stretch}.builder-actions button,.publish-bar button{flex:1}.source-textarea{min-height:280px}}
 .worksheet-image-dropzone{min-height:180px;display:flex;flex-direction:column;justify-content:center;gap:7px;text-align:center;padding:18px;cursor:pointer}.worksheet-image-dropzone input{display:none}.worksheet-source-image{max-height:240px;max-width:100%;object-fit:contain;border-radius:10px}.worksheet-preview-image{display:block;max-width:360px;max-height:220px;object-fit:contain;border-radius:10px;margin-top:10px;border:1px solid #e5e7eb}.image-file-row{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:8px;padding:9px 11px;background:#fafafa;border:1px solid #eee;border-radius:9px}
+
+.publish-student-list{display:grid;gap:6px;max-height:320px;overflow:auto;margin-top:10px;border:1px solid #eee9e1;border-radius:10px;padding:8px}
+.publish-student-row{display:flex;align-items:center;gap:10px;padding:8px 9px;border-radius:8px}
+.publish-student-row:hover{background:#faf9f7}
+.publish-student-row input{width:auto}
+.publish-student-row small{color:#888;margin-left:auto}
+.publish-toolbar{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-top:12px}
+.publish-count{font-weight:700;color:#5b21b6}
+.worksheet-template-header{background:#faf9f7;border:1px solid #e5dfd7;border-radius:12px;padding:14px 16px;margin-bottom:16px;display:flex;justify-content:space-between;gap:14px;flex-wrap:wrap}
+.worksheet-template-header b{display:block;font-size:15px}
+.worksheet-template-header .school-name{font-size:13px;color:#666;margin-bottom:4px}
+.worksheet-template-header .student-line{color:#555;font-size:13px;margin-top:3px}
+.font-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px;padding:9px 11px;background:#f6f3ee;border-radius:10px}
+.font-toolbar span{font-size:12px;color:#777;font-weight:700}
+.font-toolbar button{border:1px solid #ddd7ce;background:#fff;border-radius:8px;padding:6px 10px;font-size:13px}
+.font-toolbar button.active{background:#222;color:#fff;border-color:#222}
+.checked-badge{display:inline-flex;align-items:center;gap:4px;color:#28623b;font-weight:700;font-size:12px}
 `;
 
 
@@ -233,17 +295,60 @@ function getWorksheetForStudent(id: string) {
   return readWorksheetStore().find(x => x.id === id && x.status === "published");
 }
 
+
+
+
 export default function App(){
-  const [lang,setLang]=useState<Lang>("zh");
-  const [role,setRole]=useState<Role|null>(null);
-  const [studentId,setStudentId]=useState<string|null>(null);
-  const [view,setView]=useState<View>("home");
+  
+  const [lang, setLang] = useState<Lang>(() => load("va_lang", "zh"));
+const [role, setRole] = useState<Role | null>(() => load("va_role", null));
+const [studentId, setStudentId] = useState<string | null>(() => load("va_student_id", null));
+const [view, setView] = useState<View>(() => load("va_view", "home"));
   const [students,setStudents]=useState<Student[]>(()=>load("va_students",seedStudents));
   const [classes,setClasses]=useState<ClassItem[]>(()=>load("va_classes",seedClasses));
   const [topics,setTopics]=useState<Topic[]>(()=>load("va_topics",seedTopics));
   const [subs,setSubs]=useState<Submission[]>(()=>load("va_submissions",[]));
-  const [worksheets,setWorksheets]=useState<Worksheet[]>(()=>load<any[]>("va_worksheets",[]).map((w:any)=>({...w,questions:rebalanceTo100(normalizeWorksheetQuestions(w.questions||[]))})));
+  const [worksheets,setWorksheets]=useState<Worksheet[]>(()=>load<any[]>("va_worksheets",[]).map((w:any)=>({...w,questions:rebalanceTo100(w.questions||[])})));
   const [teacherPassword,setTeacherPassword]=useState(TEACHER_PASSWORD);
+  useEffect(() => {
+    const fetchSubmissions = async () => {
+      const { data, error } = await supabase.from('submissions').select('*');
+      if (!error && data) {
+        setSubs(data);
+      }
+    };
+
+    fetchSubmissions();
+
+    const channel = supabase
+      .channel('realtime-submissions')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'submissions' },
+        (payload) => {
+          if (payload.eventType === 'INSERT') {
+            setSubs((prev) => [payload.new as Submission, ...prev]);
+          } else if (payload.eventType === 'UPDATE') {
+            setSubs((prev) =>
+              prev.map((item) => (item.id === payload.new.id ? (payload.new as Submission) : item))
+            );
+          }
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, []);
+  
+  
+  
+  useEffect(() => localStorage.setItem("va_lang", JSON.stringify(lang)), [lang]);
+useEffect(() => localStorage.setItem("va_role", JSON.stringify(role)), [role]);
+useEffect(() => localStorage.setItem("va_student_id", JSON.stringify(studentId)), [studentId]);
+useEffect(() => localStorage.setItem("va_view", JSON.stringify(view)), [view]);
+  
   useEffect(()=>localStorage.setItem("va_students",JSON.stringify(students)),[students]);
   useEffect(()=>localStorage.setItem("va_classes",JSON.stringify(classes)),[classes]);
   useEffect(()=>localStorage.setItem("va_topics",JSON.stringify(topics)),[topics]);
@@ -252,13 +357,14 @@ export default function App(){
   const t=(zh:string,en:string)=>lang==="zh"?zh:en;
   const student=students.find(s=>s.id===studentId);
   const topicName=(x:Topic)=>lang==="zh"?x.nameZh:x.nameEn;
-  const logout=()=>{setRole(null);setStudentId(null);setView("home")};
-  if(!role) return <><style>{V4_STYLES}</style><LoginScreen lang={lang} setLang={setLang} students={students} classes={classes} password={teacherPassword}
-    onStudent={(id,l)=>{setStudentId(id);setLang(l);setRole("student");setView("home")}}
-    onTeacher={(p)=>{if(p===teacherPassword){setRole("teacher");setView("dashboard")} else alert(t("老師密碼不正確","Incorrect teacher password."))}} /></>;
-  if(role==="student" && student) return <><style>{V4_STYLES}</style><StudentApp {...{student,lang,setLang,view,setView,topics,subs,setSubs,classes,worksheets,topicName,t,logout}} /></>;
-  return <><style>{V4_STYLES}</style><TeacherApp {...{lang,setLang,view,setView,students,setStudents,classes,setClasses,topics,setTopics,subs,setSubs,worksheets,setWorksheets,topicName,t,logout}} /></>;
-}
+const logout = () => {
+  setRole(null);
+  setStudentId(null);
+  setView("home");
+  localStorage.removeItem("va_role");
+  localStorage.removeItem("va_student_id");
+  localStorage.removeItem("va_view");
+};}
 
 function LoginScreen({lang,setLang,students,classes,password,onStudent,onTeacher}:{lang:Lang;setLang:(x:Lang)=>void;students:Student[];classes:ClassItem[];password:string;onStudent:(id:string,l:Lang)=>void;onTeacher:(p:string)=>void}){
   const [classId,setClassId]=useState(classes[0]?.id||"2A");
@@ -273,7 +379,7 @@ function LoginScreen({lang,setLang,students,classes,password,onStudent,onTeacher
   };
   return <div className="login-page">
     <div className="login-card">
-      <h1>地利亞修女紀念學校 (協和二中)</h1><p className="login-department">視覺藝術科 · Visual Arts Department</p>
+      <h1>地利亞修女紀念學校 (協和二中) Delia Memorial School (Hip Wo No.2 College)</h1><p className="login-department">視覺藝術科 · Visual Arts Department</p>
       <p>{t("視覺藝術作品記錄及評分系統","Visual Arts Portfolio & Assessment")}</p>
       <div className="language-row">
         <button className={lang==="zh"?"active":""} onClick={()=>setLang("zh")}>中文</button>
@@ -306,6 +412,9 @@ function StudentApp(p:any){
   const [selectedSubmissionId,setSelectedSubmissionId]=useState<string|null>(null);
   const selectedSubmission=mySubs.find((s:Submission)=>s.id===selectedSubmissionId)||null;
   const selectedTopic=selectedSubmission?myTopics.find((x:Topic)=>x.id===selectedSubmission.topicId):null;
+  const selectedWorksheet=selectedSubmission&&selectedTopic?.rubricId==="worksheet"
+  ? worksheets.find((w:Worksheet)=>w.id===selectedTopic.worksheetId)
+  : null;
   return <div className="app">
     <header className="topbar">
       <div className="brand"><div><b>{t("地利亞修女紀念學校 (協和二中)","Delia Memorial School (Hip Wo No.2 College)")}</b><small>{t("視覺藝術科 · 學生作品平台","Visual Arts Department · Student Portfolio")}</small></div></div>
@@ -329,15 +438,30 @@ function StudentApp(p:any){
       {view==="upload"&&<UploadView {...{student,myTopics,latestFor,topicName,t,subs,setSubs,setView}}/>}
       {view==="studentWorksheet"&&<StudentWorksheetView {...{student,myTopics,worksheets,topicName,t,subs,setSubs,setView}}/>}
     </main>
-    {selectedSubmission&&selectedTopic&&<SubmissionReviewModal sub={selectedSubmission} topic={selectedTopic} t={t} onClose={()=>setSelectedSubmissionId(null)}/>} 
+    {selectedSubmission&&selectedTopic&&(selectedWorksheet
+  ? <StudentWorksheetReview ws={selectedWorksheet} sub={selectedSubmission} t={t} onClose={()=>setSelectedSubmissionId(null)}/>
+  : <SubmissionReviewModal sub={selectedSubmission} topic={selectedTopic} t={t} onClose={()=>setSelectedSubmissionId(null)}/>
+)} 
   </div>
 }
 
 function StudentWorksheetView({student,myTopics,worksheets,topicName,t,subs,setSubs,setView}:any){
-  const published=worksheets.filter((w:Worksheet)=>w.status==="published"&&w.classIds.includes(student.classId));
+  const published=worksheets.filter((w:Worksheet)=>w.status==="published"&&(w.studentIds?.length?w.studentIds.includes(student.id):w.classIds.includes(student.classId)));
   const [selectedId,setSelectedId]=useState<string|null>(null);
   const [answers,setAnswers]=useState<Record<string,string>>({});
   const [reviewId,setReviewId]=useState<string|null>(null);
+  const [fontFamily,setFontFamily]=useState<string>(()=>localStorage.getItem("va_student_font")||"default");
+  const [fontSize,setFontSize]=useState<string>(()=>localStorage.getItem("va_student_fontsize")||"m");
+  useEffect(()=>localStorage.setItem("va_student_font",fontFamily),[fontFamily]);
+  useEffect(()=>localStorage.setItem("va_student_fontsize",fontSize),[fontSize]);
+  const fontStacks:Record<string,string>={
+    default:"Inter,-apple-system,BlinkMacSystemFont,\"Segoe UI\",\"PingFang TC\",\"Microsoft JhengHei\",sans-serif",
+    rounded:"\"Varela Round\",\"Helvetica Rounded\",\"PingFang TC\",\"Microsoft JhengHei\",sans-serif",
+    serif:"Georgia,\"Noto Serif TC\",\"PMingLiU\",serif",
+    mono:"\"Courier New\",\"Cascadia Mono\",monospace"
+  };
+  const sizeMap:Record<string,string>={s:"14px",m:"17px",l:"20px"};
+  const modalStyle={fontFamily:fontStacks[fontFamily],fontSize:sizeMap[fontSize]};
   const ws=published.find((w:Worksheet)=>w.id===selectedId)||null;
   const reviewSub=reviewId?subs.find((s:Submission)=>s.id===reviewId)||null:null;
   const review=reviewSub?published.find((w:Worksheet)=>w.id===reviewSub.worksheetId)||null:null;
@@ -365,9 +489,14 @@ function StudentWorksheetView({student,myTopics,worksheets,topicName,t,subs,setS
     <PageTitle title={t("我的工作紙","My Worksheets")} sub={t("完成後可以再次查看自己的答案、錯題及正確答案。","After submission, you can review your answers, mistakes and correct answers.")}/>
     {!published.length?<div className="empty"><BookOpen size={35}/><h3>{t("目前沒有已發布工作紙","No published worksheets")}</h3></div>:
     <div className="table-card">{published.map((w:Worksheet)=>{const sub=subs.filter((x:Submission)=>x.studentId===student.id&&x.worksheetId===w.id).sort((a:Submission,b:Submission)=>b.version-a.version)[0];return <div className="table-row" key={w.id}><button className="clickable-row" onClick={()=>setSelectedId(w.id)}><b>{t(w.titleZh,w.titleEn)}</b><small>{w.questions.length} {t("題","questions")} · 100 {t("分","points")}</small></button><span>{sub?`${sub.autoScore??0}/100`:t("未完成","Not started")}</span><button className="outline small" onClick={()=>sub&&setReviewId(sub.id)} disabled={!sub}>{t("查看作答","Review")}</button></div>})}</div>}
-    {ws&&<Modal title={t(ws.titleZh,ws.titleEn)} onClose={()=>setSelectedId(null)}><div className="review-modal-content">{ws.questions.map((q:WorksheetQuestion,i:number)=><div className="worksheet-question" key={q.id}><div className="question-head"><b>{i+1}. {q.type==="mc"?t("選擇題","Multiple Choice"):q.type==="fill"?t("填充題","Fill in the Blank"):t("短答題","Short Answer")}</b><span>{q.points} {t("分","pts")}</span></div><h3>{q.question}</h3>{q.questionEn&&<p className="muted">{q.questionEn}</p>}{q.options&&<div className="answer-options">{q.options.map(o=><label key={o.label}><input type="radio" name={q.id} checked={answers[q.id]===o.label} onChange={()=>setAnswers({...answers,[q.id]:o.label})}/><b>{o.label}</b> {o.zh}{o.en?` / ${o.en}`:""}</label>)}</div>}{q.type==="fill"&&<input value={answers[q.id]||""} onChange={e=>setAnswers({...answers,[q.id]:e.target.value})} placeholder={t("輸入答案…","Type your answer…")}/>} {q.type==="short"&&<textarea value={answers[q.id]||""} onChange={e=>setAnswers({...answers,[q.id]:e.target.value})} placeholder={t("請輸入答案…","Type your answer…")}/>}</div>)}<div className="publish-bar"><button className="primary" onClick={submit}>{t("提交工作紙","Submit Worksheet")}</button></div></div></Modal>}
+    {ws&&<Modal title={t(ws.titleZh,ws.titleEn)} onClose={()=>setSelectedId(null)}><div className="review-modal-content" style={modalStyle}>
+      <div className="worksheet-template-header"><div><div className="school-name">{t("地利亞修女紀念學校 (協和二中) · 視覺藝術科","Delia Memorial School (Hip Wo No.2 College) · Visual Arts")}</div><b>{t(ws.titleZh,ws.titleEn)}</b></div><div className="student-line"><div>{t("姓名","Name")}: <b>{student.name}</b></div><div>{t("班別","Class")}: <b>{student.classId}</b> {t("學號","No.")}: <b>{student.number}</b></div><div>{t("日期","Date")}: {dateText(now())}</div></div></div>
+      <div className="font-toolbar"><span>{t("字體","Font")}</span><button className={fontFamily==="default"?"active":""} onClick={()=>setFontFamily("default")}>{t("預設","Default")}</button><button className={fontFamily==="rounded"?"active":""} onClick={()=>setFontFamily("rounded")}>{t("圓體","Rounded")}</button><button className={fontFamily==="serif"?"active":""} onClick={()=>setFontFamily("serif")}>{t("宋體","Serif")}</button><button className={fontFamily==="mono"?"active":""} onClick={()=>setFontFamily("mono")}>{t("等寬","Mono")}</button><span>{t("大小","Size")}</span><button className={fontSize==="s"?"active":""} onClick={()=>setFontSize("s")}>A-</button><button className={fontSize==="m"?"active":""} onClick={()=>setFontSize("m")}>A</button><button className={fontSize==="l"?"active":""} onClick={()=>setFontSize("l")}>A+</button></div>
+      {ws.sourceImage&&<img className="worksheet-source-image" src={ws.sourceImage} alt="" />}
+      {ws.questions.map((q:WorksheetQuestion,i:number)=><div className="worksheet-question" key={q.id}><div className="question-head"><b>{i+1}. {q.type==="mc"?t("選擇題","Multiple Choice"):q.type==="fill"?t("填充題","Fill in the Blank"):t("短答題","Short Answer")}</b><span>{q.points} {t("分","pts")}</span></div><h3>{q.question}</h3>{q.questionEn&&<p className="muted">{q.questionEn}</p>}{q.options&&<div className="answer-options">{q.options.map(o=><label key={o.label}><input type="radio" name={q.id} checked={answers[q.id]===o.label} onChange={()=>setAnswers({...answers,[q.id]:o.label})}/><b>{o.label}</b> {o.zh}{o.en?` / ${o.en}`:""}</label>)}</div>}{q.type==="fill"&&<input value={answers[q.id]||""} onChange={e=>setAnswers({...answers,[q.id]:e.target.value})} placeholder={t("輸入答案…","Type your answer…")}/>} {q.type==="short"&&<textarea value={answers[q.id]||""} onChange={e=>setAnswers({...answers,[q.id]:e.target.value})} placeholder={t("請輸入答案…","Type your answer…")}/>}</div>)}<div className="publish-bar"><button className="primary" onClick={submit}>{t("提交工作紙","Submit Worksheet")}</button></div></div></Modal>}
     {reviewSub&&review&&<StudentWorksheetReview ws={review} sub={reviewSub} t={t} onClose={()=>setReviewId(null)}/>}
   </div>;
+  
 }
 
 function StudentWorksheetReview({ws,sub,t,onClose}:any){
@@ -406,13 +535,96 @@ function UploadView({student,myTopics,latestFor,topicName,t,subs,setSubs,setView
 }
 
 function FeedbackView({mySubs,myTopics,topicName,t,onOpenSubmission}:any){
-  const assessed=mySubs.filter((s:Submission)=>s.status==="assessed").sort((a:Submission,b:Submission)=>b.assessedAt?.localeCompare(a.assessedAt||"")||0);
-  return <div><PageTitle title={t("教師評語","Teacher Feedback")} sub={t("查看作品、分項評核、評語及改善建議","View artwork, assessment criteria, comments and areas for improvement")}/>{assessed.length?<div className="feedback-list">{assessed.map((s:Submission)=>{const topic=myTopics.find((x:Topic)=>x.id===s.topicId);const total=s.marks?.reduce((a:number,b:number)=>a+b,0)||0;return <button className="feedback-item" key={s.id} onClick={()=>onOpenSubmission(s.id)}><img src={s.image}/><div><b>{topic?topicName(topic):""}</b><small>{s.assessedAt&&dateText(s.assessedAt)}</small><p>{[...(s.feedbackGood||[]),...(s.feedbackImprove||[])].length?t("已記錄優點及改善方向","Strengths and areas for improvement recorded"):t("已完成評核","Assessment completed")}</p></div><strong>{total}/100</strong><ChevronRight/></button>})}</div>:<div className="empty"><BookOpen size={35}/><h3>{t("暫時沒有已評核作品","No assessed artworks yet")}</h3></div>}</div>
+  const assessed=mySubs
+  .filter((s:Submission)=>s.status==="assessed")
+  .filter((s:Submission)=>myTopics.some((topic:Topic)=>topic.id===s.topicId))
+  .sort((a:Submission,b:Submission)=>b.assessedAt?.localeCompare(a.assessedAt||"")||0);
+
+  return <div>
+    <PageTitle
+      title={t("教師評語","Teacher Feedback")}
+      sub={t("查看作品、分項評核、評語及改善建議","View artwork, assessment criteria, comments and areas for improvement")}
+    />
+    {assessed.length
+      ? <div className="feedback-list">
+          {assessed.map((s:Submission)=>{
+            const topic=myTopics.find((x:Topic)=>x.id===s.topicId);
+            const total=s.marks?.reduce((a:number,b:number)=>a+b,0)||0;
+
+            return <button
+              className="feedback-item"
+              key={s.id}
+              onClick={()=>onOpenSubmission(s.id)}
+            >
+              <img src={s.image}/>
+              <div>
+                <b>{topic?topicName(topic):""}</b>
+                <small>{s.assessedAt&&dateText(s.assessedAt)}</small>
+                <p>
+                  {[...(s.feedbackGood||[]),...(s.feedbackImprove||[])].length
+                    ? t("已記錄優點及改善方向","Strengths and areas for improvement recorded")
+                    : t("已完成評核","Assessment completed")}
+                </p>
+              </div>
+              <strong>{total}/100</strong>
+              <ChevronRight/>
+            </button>
+          })}
+        </div>
+      : <div className="empty">
+          <BookOpen size={35}/>
+          <h3>{t("暫時沒有已評核作品","No assessed artworks yet")}</h3>
+        </div>
+    }
+  </div>
 }
 
 function SubmissionReviewModal({sub,topic,t,onClose}:any){
   const total=sub.marks?.reduce((a:number,b:number)=>a+b,0)||0;
-  return <Modal title={t("作品評核結果","Assessment Result")} onClose={onClose}><div className="review-modal-content"><img className="review-image" src={sub.image}/><div className="review-result-score"><b>{total}</b><span>/100</span></div><h3>{topic.nameZh}</h3><p className="muted">{topic.nameEn} · {t("提交","Submitted")} {dateText(sub.uploadedAt)} · Version {sub.version}</p><div className="review-criteria-list">{rubric.map((r:any,i:number)=>{const mark=sub.marks?.[i]||0;const level=levelForMark(mark);const lv=r.levels.find((x:any)=>x[0]===level);return <div className="review-criteria-item" key={r.id}><div><b>{i+1}. {langLabel(r,t)}</b><span>{t(lv?.[0]||"0",lv?.[1]||"0")} · {mark}/25</span></div>{lv?.[2]&&<p>{lv[2]}</p>}</div>})}</div><div className="feedback-summary"><h4>{t("優點","Strengths")}</h4><p>{(sub.feedbackGood||[]).map((id:string)=>{const o=goodOptions.find((x:any)=>x[0]===id);return o?t(o[2],o[1]):""}).filter(Boolean).join("；")||t("沒有額外記錄","No additional strengths recorded")}</p><h4>{t("改善方向","Areas for Improvement")}</h4><p>{(sub.feedbackImprove||[]).map((id:string)=>{const o=improveOptions.find((x:any)=>x[0]===id);return o?t(o[2],o[1]):""}).filter(Boolean).join("；")||t("沒有額外建議","No additional improvement suggestions")}</p><h4>{t("教師評語","Teacher Comment")}</h4><p>{sub.comment||t("沒有補充評語","No additional comment")}</p></div></div></Modal>
+
+  return <Modal title={t("作品評核結果","Assessment Result")} onClose={onClose}>
+    <div className="review-modal-content">
+      <img className="review-image" src={sub.image}/>
+      <div className="review-result-score">
+        <b>{total}</b><span>/100</span>
+      </div>
+      <h3>{topic.nameZh}</h3>
+      <p className="muted">
+        {topic.nameEn} · {t("提交","Submitted")} {dateText(sub.uploadedAt)} · Version {sub.version}
+      </p>
+      <div className="review-criteria-list">
+        {rubric.map((r:any,i:number)=>{
+          const mark=sub.marks?.[i]||0;
+          const level=levelForMark(mark);
+          const lv=r.levels.find((x:any)=>x[0]===level);
+
+          return <div className="review-criteria-item" key={r.id}>
+            <div>
+              <b>{i+1}. {langLabel(r,t)}</b>
+              <span>{t(lv?.[0]||"0",lv?.[1]||"0")} · {mark}/25</span>
+            </div>
+            {lv?.[2]&&<p>{lv[2]}</p>}
+          </div>
+        })}
+      </div>
+      <div className="feedback-summary">
+        <h4>{t("優點","Strengths")}</h4>
+        <p>{(sub.feedbackGood||[]).map((id:string)=>{
+          const o=goodOptions.find((x:any)=>x[0]===id);
+          return o?t(o[2],o[1]):"";
+        }).filter(Boolean).join("；")||t("沒有額外記錄","No additional strengths recorded")}</p>
+
+        <h4>{t("改善方向","Areas for Improvement")}</h4>
+        <p>{(sub.feedbackImprove||[]).map((id:string)=>{
+          const o=improveOptions.find((x:any)=>x[0]===id);
+          return o?t(o[2],o[1]):"";
+        }).filter(Boolean).join("；")||t("沒有額外建議","No additional improvement suggestions")}</p>
+
+        <h4>{t("教師評語","Teacher Comment")}</h4>
+        <p>{sub.comment||t("沒有補充評語","No additional comment")}</p>
+      </div>
+    </div>
+  </Modal>
 }
 
 function TeacherApp(p:any){
@@ -420,7 +632,7 @@ function TeacherApp(p:any){
   const openStudent=(id:string)=>{setSelectedStudentId(id);setView("book")};
   return <div className="app"><header className="topbar"><div className="brand"><div><b>{t("地利亞修女紀念學校 (協和二中)","Delia Memorial School (Hip Wo No.2 College)")}</b><small>{t("視覺藝術科 · 教師管理平台","Visual Arts Department · Teacher Management")}</small></div></div><div className="top-actions"><div className="language-row compact"><button className={lang==="zh"?"active":""} onClick={()=>setLang("zh")}>中文</button><button className={lang==="en"?"active":""} onClick={()=>setLang("en")}>EN</button></div><span className="teacher-badge"><ShieldCheck size={15}/>{t("教師","Teacher")}</span><button className="icon-btn" onClick={logout}><LogOut size={17}/></button></div></header>
     <div className="teacher-layout"><aside className="sidebar">{[["dashboard",t("總覽","Overview"),Clipboard],["students",t("學生管理","Students"),Users],["topics",t("課題管理","Topics"),BookOpen],["assessment",t("評核","Assessment"),Check],["book",t("學生作品紀錄","Portfolio Records"),BookOpen],["grades",t("成績","Grades"),Copy],["worksheetLibrary",t("工作紙管理","Worksheet Management"),BookOpen],["aiWorksheet",t("AI 建立工作紙","AI Worksheet"),Edit3]].map(([id,label,I]:any)=><button key={id} className={view===id?"active":""} onClick={()=>setView(id)}><I size={17}/>{label}</button>)}</aside><main className="main teacher-main">
-      {view==="dashboard"&&<Dashboard {...{students,classes,topics,subs,t,setView}}/>}{view==="students"&&<StudentsView {...{students,setStudents,classes,setClasses,topics,setTopics,t,onOpenStudent:openStudent}}/>}{view==="topics"&&<TopicsView {...{topics,setTopics,classes,worksheets,setWorksheets,t}}/>}{view==="assessment"&&<AssessmentView {...{students,classes,topics,subs,setSubs,t,topicName}}/>}{view==="book"&&<BookView {...{students,classes,topics,subs,t,topicName,initialStudentId:selectedStudentId}}/>}{view==="grades"&&<GradesView {...{students,classes,topics,subs,t,topicName}}/>}{view==="worksheetLibrary"&&<WorksheetLibrary {...{worksheets,setWorksheets,topics,setTopics,classes,t}}/>}{view==="aiWorksheet"&&<WorksheetBuilder {...{worksheets,setWorksheets,classes,t}}/>}
+      {view==="dashboard"&&<Dashboard {...{students,classes,topics,subs,t,setView}}/>}{view==="students"&&<StudentsView {...{students,setStudents,classes,setClasses,topics,setTopics,t,onOpenStudent:openStudent}}/>}{view==="topics"&&<TopicsView {...{topics,setTopics,classes,students,worksheets,setWorksheets,t}}/>}{view==="assessment"&&<AssessmentView {...{students,classes,topics,subs,setSubs,t,topicName}}/>}{view==="book"&&<BookView {...{students,classes,topics,subs,setSubs,worksheets,t,topicName,initialStudentId:selectedStudentId}}/>}{view==="grades"&&<GradesView {...{students,classes,topics,subs,t,topicName}}/>}{view==="worksheetLibrary"&&<WorksheetLibrary {...{worksheets,setWorksheets,topics,setTopics,classes,students,t}}/>}{view==="aiWorksheet"&&<WorksheetBuilder {...{worksheets,setWorksheets,classes,t}}/>}
     </main></div></div>
 }
 
@@ -463,26 +675,27 @@ function ClassModal({mode,classItem,t,onSave,onClose}:any){
   return <Modal title={mode==="edit"?t("修改班別","Edit Class"):t("新增班別","Add Class")} onClose={onClose}><label>{t("班別名稱","Class Name")}</label><input autoFocus value={x.id} onChange={e=>setX({...x,id:e.target.value,name:e.target.value})} placeholder={t("例如：2A","e.g. 2A")}/><div className="modal-actions"><button className="outline" onClick={onClose}>{t("取消","Cancel")}</button><button className="primary" onClick={()=>onSave(x,mode==="add")}>{t("儲存","Save")}</button></div></Modal>
 }
 
-function TopicsView({topics,setTopics,classes,worksheets,setWorksheets,t}:any){
-  const [classId,setClassId]=useState(classes[0]?.id||""); const [editing,setEditing]=useState<Topic|null>(null); const [adding,setAdding]=useState(false);
+function TopicsView({topics,setTopics,classes,students,worksheets,setWorksheets,t}:any){
+  const [classId,setClassId]=useState(classes[0]?.id||""); const [editing,setEditing]=useState<Topic|null>(null); const [adding,setAdding]=useState(false); const [publishing,setPublishing]=useState<Worksheet|null>(null);
   const classTopics=topics.filter((x:Topic)=>x.classIds.includes(classId));
   const save=(x:Topic)=>{setTopics(topics.some((z:Topic)=>z.id===x.id)?topics.map((z:Topic)=>z.id===x.id?x:z):[...topics,x]);setEditing(null);setAdding(false)};
   const remove=(id:string)=>{if(confirm(t("確定刪除此課題？","Delete this topic?")))setTopics(topics.filter((x:Topic)=>x.id!==id))};
   const draftWorksheets=(worksheets||[]).filter((w:Worksheet)=>w.status==="draft");
-  const publishWorksheet=(ws:Worksheet)=>{
-    const targetClass=ws.classIds[0]||classes[0]?.id;
-    if(!targetClass){alert(t("請先建立班別。","Create a class first."));return;}
+  const publishWorksheet=(ws:Worksheet,studentIds:string[])=>{
+    const classIds=Array.from(new Set(students.filter((s:Student)=>studentIds.includes(s.id)).map((s:Student)=>s.classId))) as string[];
     const topicId=`t-ws-${Date.now()}`;
-    const topic:Topic={id:topicId,nameZh:ws.titleZh,nameEn:ws.titleEn,date:new Date().toISOString().slice(0,10),dueDate:ws.dueDate,submissions:1,classIds:ws.classIds.length?ws.classIds:[targetClass],rubricId:"worksheet",worksheetId:ws.id};
+    const topic:Topic={id:topicId,nameZh:ws.titleZh,nameEn:ws.titleEn,date:new Date().toISOString().slice(0,10),dueDate:ws.dueDate,submissions:1,classIds,rubricId:"worksheet",worksheetId:ws.id};
     setTopics([...topics,topic]);
-    setWorksheets((worksheets||[]).map((x:Worksheet)=>x.id===ws.id?{...x,status:"published",topicId,updatedAt:now()}:x));
-    alert(t("已發布到課題管理；學生現在可以看到工作紙。","Published to Topic Management; students can now see the worksheet."));
+    setWorksheets((worksheets||[]).map((x:Worksheet)=>x.id===ws.id?{...x,status:"published",topicId,classIds,studentIds,updatedAt:now()}:x));
+    setPublishing(null);
+    alert(t("已發布到課題管理；已選學生現在可以看到工作紙。","Published to Topic Management; the selected students can now see the worksheet."));
   };
   return <><PageTitle title={t("課題管理","Topic Management")} sub={t("先選班別，再管理該班課題、日期、提交數量及評分準則","Select a class, then manage its topics, dates, submissions and rubric")} action={<button className="primary" onClick={()=>setAdding(true)}><Plus size={16}/>{t("新增課題","Add Topic")}</button>}/>
-    {draftWorksheets.length>0&&<div className="worksheet-publish-panel"><div><h2>{t("待發布工作紙","Worksheet Drafts Ready to Publish")}</h2><p>{t("工作紙建立後先保留草稿；在這裡選擇「發布」，才會真正交給學生。","Worksheets stay as drafts until you publish them here.")}</p></div>{draftWorksheets.map((w:Worksheet)=><div className="worksheet-draft-row" key={w.id}><div><b>{t(w.titleZh,w.titleEn)}</b><small>{w.questions.length} {t("題 · 總分 100","questions · total 100")}</small></div><button className="primary small" onClick={()=>publishWorksheet(w)}><Check size={14}/>{t("發布給學生","Publish to Students")}</button></div>)}</div>}
+    {draftWorksheets.length>0&&<div className="worksheet-publish-panel"><div><h2>{t("待發布工作紙","Worksheet Drafts Ready to Publish")}</h2><p>{t("工作紙建立後先保留草稿；在這裡選擇「發布給學生」，可以指定發布給哪些學生。","Worksheets stay as drafts until you publish them here. You can choose exactly which students receive each one.")}</p></div>{draftWorksheets.map((w:Worksheet)=><div className="worksheet-draft-row" key={w.id}><div><b>{t(w.titleZh,w.titleEn)}</b><small>{w.questions.length} {t("題 · 總分 100","questions · total 100")}</small></div><button className="primary small" onClick={()=>setPublishing(w)}><Check size={14}/>{t("發布給學生","Publish to Students")}</button></div>)}</div>}
     <div className="class-tabs">{classes.map((c:ClassItem)=><button key={c.id} className={classId===c.id?"selected":""} onClick={()=>setClassId(c.id)}>{c.id}<small>{topics.filter((x:Topic)=>x.classIds.includes(c.id)).length}</small></button>)}</div>
     <div className="table-card">{classTopics.map((x:Topic)=><div className="table-row topic-row" key={x.id}><div><b>{x.nameZh}</b><small>{x.nameEn}</small></div><div>{dateText(x.date)}<small>{t("截止日期","Due Date")}: {dateText(x.dueDate)}</small></div><div>{x.submissions} {t("份","submission(s)")}</div><div className="row-actions"><button className="outline small" onClick={()=>setEditing(x)}><Edit3 size={14}/>{t("修改","Edit")}</button><button className="outline small" onClick={()=>remove(x.id)}><Trash2 size={14}/>{t("刪除","Delete")}</button></div></div>)}</div>
     {(editing||adding)&&<TopicModal topic={editing||{id:`t-${Date.now()}`,nameZh:"",nameEn:"",date:new Date().toISOString().slice(0,10),dueDate:new Date().toISOString().slice(0,10),submissions:1,classIds:[classId],rubricId:"default"}} classes={classes} t={t} onSave={save} onClose={()=>{setEditing(null);setAdding(false)}}/>}
+    {publishing&&<PublishWorksheetModal worksheet={publishing} classes={classes} students={students} t={t} onPublish={(ids:string[])=>publishWorksheet(publishing,ids)} onClose={()=>setPublishing(null)}/>}
   </>
 }
 
@@ -538,10 +751,11 @@ function rangeValues(level:string){const [a,b]=levelRange(level);return Array.fr
 function levelForMark(n:number){if(n===0)return "0";if(n>=21)return "高";if(n>=16)return "中高";if(n>=11)return "中";if(n>=6)return "中低";return "低"}
 function langLabel(r:any,t:any){return t(r.zh,r.en)}
 
-function BookView({students,classes,topics,subs,t,topicName,initialStudentId}:any){
-  const initial=students.find((x:Student)=>x.id===initialStudentId); const [classId,setClassId]=useState(initial?.classId||classes[0]?.id||""); const [sid,setSid]=useState<string|null>(initialStudentId||null); const [reviewId,setReviewId]=useState<string|null>(null);
+function BookView({students,classes,topics,subs,setSubs,worksheets,t,topicName,initialStudentId}:any){
+  const initial=students.find((x:Student)=>x.id===initialStudentId); const [classId,setClassId]=useState(initial?.classId||classes[0]?.id||""); const [sid,setSid]=useState<string|null>(initialStudentId||null); const [reviewId,setReviewId]=useState<string|null>(null); const [wsReviewId,setWsReviewId]=useState<string|null>(null);
   useEffect(()=>{if(initialStudentId){const st=students.find((x:Student)=>x.id===initialStudentId);if(st){setClassId(st.classId);setSid(st.id)}}},[initialStudentId]);
   const list=students.filter((st:Student)=>st.classId===classId).sort((a:Student,b:Student)=>Number(a.number)-Number(b.number)); const s=list.find((x:Student)=>x.id===sid); const reviewSub=subs.find((x:Submission)=>x.id===reviewId); const reviewTopic=reviewSub?topics.find((x:Topic)=>x.id===reviewSub.topicId):null;
+  const wsReviewSub=subs.find((x:Submission)=>x.id===wsReviewId); const wsReviewTopic=wsReviewSub?topics.find((x:Topic)=>x.id===wsReviewSub.topicId):null; const wsReviewWorksheet=wsReviewTopic?(worksheets||[]).find((w:Worksheet)=>w.id===wsReviewTopic.worksheetId):null;
   return <><PageTitle title={t("學生作品紀錄","Student Portfolio Records")} sub={t("按班別及學生一覽作品、分項評核及教師評語","Review artwork, assessment criteria and teacher feedback by class and student")}/>
     <div className="class-tabs">{classes.map((c:ClassItem)=><button key={c.id} className={classId===c.id?"selected":""} onClick={()=>{setClassId(c.id);setSid(null)}}>{c.id}</button>)}</div>
     <div className="control-row"><select value={sid||""} onChange={e=>setSid(e.target.value)}><option value="">{t("選擇學生","Select student")}</option>{list.map((x:Student)=><option key={x.id} value={x.id}>{x.number} · {x.name}</option>)}</select></div>
@@ -549,10 +763,31 @@ function BookView({students,classes,topics,subs,t,topicName,initialStudentId}:an
       {list.map((x:Student)=>{const assessed=subs.filter((q:Submission)=>q.studentId===x.id&&q.status==="assessed");const avg=assessed.length?Math.round(assessed.reduce((a,q)=>a+(q.marks?.reduce((u,v)=>u+v,0)||0),0)/assessed.length):null;return <button className={`table-row clickable-row ${sid===x.id?"selected-row":""}`} key={x.id} onClick={()=>setSid(x.id)}><span>{x.number}</span><span><b>{x.name}</b></span><span>{assessed.length}</span><span>{avg!==null?<strong className="score">{avg}/100</strong>:"—"}</span></button>})}
     </div>
     {s&&<div className="portfolio-list"><h2>{s.name} · {s.classId} · No.{s.number}</h2>
-      {topics.filter((x:Topic)=>x.classIds.includes(s.classId)).map(x=>{const ss=subs.filter((q:Submission)=>q.studentId===s.id&&q.topicId===x.id).sort((a:Submission,b:Submission)=>b.version-a.version);const q=ss[0];const total=q?.marks?.reduce((a:number,b:number)=>a+b,0);return <button className={`portfolio-list-row clickable-row ${q?"":"no-submission-row"}`} key={x.id} disabled={!q} onClick={()=>q&&setReviewId(q.id)}><div className="thumb">{q?<img src={q.image}/>:<BookOpen size={25}/>}</div><div className="portfolio-meta"><b>{topicName(x)}</b><span>{q?`${dateText(q.uploadedAt)} · Version ${q.version}`:t("尚未提交","Not submitted")}</span><span>{q?.assessedAt?`${t("評核日期","Assessment date")}: ${dateText(q.assessedAt)}`:""}</span></div><strong>{total!==undefined?`${total}/100`:t("待評核","Awaiting")}</strong></button>})}
+      {topics.filter((x:Topic)=>x.classIds.includes(s.classId)).map(x=>{
+        const isWorksheet=x.rubricId==="worksheet";
+        const ss=subs.filter((q:Submission)=>q.studentId===s.id&&q.topicId===x.id).sort((a:Submission,b:Submission)=>b.version-a.version);const q=ss[0];
+        if(isWorksheet){
+          return <button className={`portfolio-list-row clickable-row ${q?"":"no-submission-row"}`} key={x.id} disabled={!q} onClick={()=>q&&setWsReviewId(q.id)}><div className="thumb"><BookOpen size={25}/></div><div className="portfolio-meta"><b>{topicName(x)}</b><span>{q?`${dateText(q.uploadedAt)} · Version ${q.version}`:t("尚未完成","Not completed")}</span>{q?.teacherChecked&&<span className="checked-badge"><Check size={13}/>{t("已批閱","Checked")}</span>}</div><strong>{q?`${q.autoScore??0}/100`:t("尚未完成","Not completed")}</strong></button>;
+        }
+        const total=q?.marks?.reduce((a:number,b:number)=>a+b,0);
+        return <button className={`portfolio-list-row clickable-row ${q?"":"no-submission-row"}`} key={x.id} disabled={!q} onClick={()=>q&&setReviewId(q.id)}><div className="thumb">{q?<img src={q.image}/>:<BookOpen size={25}/>}</div><div className="portfolio-meta"><b>{topicName(x)}</b><span>{q?`${dateText(q.uploadedAt)} · Version ${q.version}`:t("尚未提交","Not submitted")}</span><span>{q?.assessedAt?`${t("評核日期","Assessment date")}: ${dateText(q.assessedAt)}`:""}</span></div><strong>{total!==undefined?`${total}/100`:t("待評核","Awaiting")}</strong></button>;
+      })}
     </div>}
     {reviewSub&&reviewTopic&&<SubmissionReviewModal sub={reviewSub} topic={reviewTopic} t={t} onClose={()=>setReviewId(null)}/>} 
+    {wsReviewSub&&wsReviewWorksheet&&<WorksheetPortfolioModal sub={wsReviewSub} worksheet={wsReviewWorksheet} subs={subs} setSubs={setSubs} t={t} onClose={()=>setWsReviewId(null)}/>}
   </>
+}
+
+function WorksheetPortfolioModal({sub,worksheet,subs,setSubs,t,onClose}:any){
+  const answers=sub.answers||{};
+  const correct=(q:WorksheetQuestion)=>{if(q.type==="short")return null;const a=String(answers[q.id]||"").trim().toLowerCase();const acc=(q.acceptedAnswers?.length?q.acceptedAnswers:[q.answer].flat().filter(Boolean) as string[]).map(x=>String(x).trim().toLowerCase());return acc.includes(a)};
+  const toggleChecked=()=>setSubs(subs.map((x:Submission)=>x.id===sub.id?{...x,teacherChecked:!x.teacherChecked}:x));
+  return <Modal title={t(worksheet.titleZh,worksheet.titleEn)} onClose={onClose}><div className="review-modal-content">
+    <div className="review-result-score"><b>{sub.autoScore??0}</b><span>/100</span></div>
+    <p className="muted">{t("提交時間","Submitted")}: {dateText(sub.uploadedAt)}</p>
+    {worksheet.questions.map((q:WorksheetQuestion,i:number)=>{const ok=correct(q);return <div className="worksheet-question" key={q.id}><div className="question-head"><b>{i+1}. {q.type==="mc"?t("選擇題","Multiple Choice"):q.type==="fill"?t("填充題","Fill in the Blank"):t("短答題","Short Answer")}</b>{ok===null?<span className="muted">{t("需人手核對","Manual check")}</span>:ok?<span>✓ {t("正確","Correct")}</span>:<span>✗ {t("錯誤","Incorrect")}</span>}</div><h3>{q.question}</h3><p><b>{t("學生答案","Student answer")}:</b> {answers[q.id]||t("沒有作答","No answer")}</p></div>})}
+    <div className="save-row"><label className="publish-student-row" style={{border:"1px solid #ddd7ce",borderRadius:9,padding:"9px 11px"}}><input type="checkbox" checked={!!sub.teacherChecked} onChange={toggleChecked}/><span>{t("我已幫學生剔（批閱）這份工作紙","I've checked/ticked this worksheet")}</span></label></div>
+  </div></Modal>;
 }
 
 
@@ -563,13 +798,21 @@ function parseWorksheetText(text:string):WorksheetQuestion[]{
   return out.filter(q=>q.question);
 }
 
-function WorksheetLibrary({worksheets,setWorksheets,topics,setTopics,classes,t}:any){
-  const [editing,setEditing]=useState<Worksheet|null>(null); const [preview,setPreview]=useState<Worksheet|null>(null); const [paste,setPaste]=useState("");
+function WorksheetLibrary({worksheets,setWorksheets,topics,setTopics,subs,setSubs,classes,students,t}:any){  const [editing,setEditing]=useState<Worksheet|null>(null); const [preview,setPreview]=useState<Worksheet|null>(null); const [paste,setPaste]=useState(""); const [publishing,setPublishing]=useState<Worksheet|null>(null);
   const save=(w:Worksheet)=>{const next=worksheets.some((x:Worksheet)=>x.id===w.id)?worksheets.map((x:Worksheet)=>x.id===w.id?{...w,updatedAt:now()}:x):[w,...worksheets];setWorksheets(next);setEditing(null);};
   const deleteWs=(id:string)=>{if(confirm(t("確定刪除這份工作紙？","Delete this worksheet?"))){setWorksheets(worksheets.filter((x:Worksheet)=>x.id!==id));}};
-  const publish=(w:Worksheet)=>{const classIds=w.classIds.length?w.classIds:classes.slice(0,1).map((c:ClassItem)=>c.id);if(!classIds.length){alert(t("請先建立班別。","Create a class first."));return;}const topicId=w.topicId||`t-ws-${Date.now()}`;const topic:Topic={id:topicId,nameZh:w.titleZh,nameEn:w.titleEn,date:new Date().toISOString().slice(0,10),dueDate:w.dueDate,submissions:1,classIds,rubricId:"worksheet",worksheetId:w.id};const nextWs=worksheets.map((x:Worksheet)=>x.id===w.id?{...x,classIds,status:"published" as const,topicId,updatedAt:now()}:x);setWorksheets(nextWs);setTopics(topics.some((x:Topic)=>x.id===topicId)?topics.map((x:Topic)=>x.id===topicId?topic:x):[...topics,topic]);alert(t("工作紙已發布，學生現在可以看到。","Worksheet published. Students can now see it."));};
+  const publish=(w:Worksheet,studentIds:string[])=>{
+    const classIds=Array.from(new Set(students.filter((s:Student)=>studentIds.includes(s.id)).map((s:Student)=>s.classId))) as string[];
+    const topicId=w.topicId||`t-ws-${Date.now()}`;
+    const topic:Topic={id:topicId,nameZh:w.titleZh,nameEn:w.titleEn,date:new Date().toISOString().slice(0,10),dueDate:w.dueDate,submissions:1,classIds,rubricId:"worksheet",worksheetId:w.id};
+    const nextWs=worksheets.map((x:Worksheet)=>x.id===w.id?{...x,classIds,studentIds,status:"published" as const,topicId,updatedAt:now()}:x);
+    setWorksheets(nextWs);
+    setTopics(topics.some((x:Topic)=>x.id===topicId)?topics.map((x:Topic)=>x.id===topicId?topic:x):[...topics,topic]);
+    setPublishing(null);
+    alert(t("工作紙已發布，已選學生現在可以看到。","Worksheet published. The selected students can now see it."));
+  };
   const importText=()=>{const qs=rebalanceTo100(parseWorksheetText(paste));if(!qs.length){alert(t("找不到題目。請按照指定格式貼上。","No questions found. Please use the supported format."));return;}const w:Worksheet={id:`ws-${Date.now()}`,titleZh:"貼上工作紙",titleEn:"Pasted Worksheet",classIds:classes.slice(0,1).map((c:ClassItem)=>c.id),dueDate:new Date().toISOString().slice(0,10),questions:qs,status:"draft",createdAt:now()};save(w);setPaste("");alert(t(`成功辨識 ${qs.length} 題。`,`${qs.length} questions imported successfully.`));};
-  return <><PageTitle title={t("工作紙管理","Worksheet Management")} sub={t("建立、修改、預覽、刪除及發布工作紙。AI 只是其中一個建立入口。","Create, edit, preview, delete and publish worksheets. AI is only one creation method.")} action={<button className="primary" onClick={()=>setPreview(null)}>{t("工作紙管理已獨立於 AI","Worksheet management is independent from AI")}</button>}/><div className="builder-card"><h2>{t("📋 直接貼上工作紙","📋 Paste an Existing Worksheet")}</h2><p className="muted">{t("格式：[第1題]、題型、題目、A-D、答案。填充題答案可用「；」分隔；短答題不需答案。","Format: [Question 1], type, question, A-D and answer. Fill-in accepted answers can be separated by semicolons; short answer needs no fixed answer.")}</p><textarea className="source-textarea" value={paste} onChange={e=>setPaste(e.target.value)} placeholder={"[第1題]\n題型：選擇題\n題目：三原色包括哪三種顏色？\n英文題目：Which are the primary colours?\nA. 紅、黃、藍\nB. 紅、綠、藍\nC. 紅、橙、紫\nD. 黃、綠、紫\n答案：A"}/><button className="primary" onClick={importText}><Clipboard size={16}/>{t("辨識並建立工作紙","Parse & Create Worksheet")}</button></div><div className="table-card">{worksheets.length===0?<div className="empty"><h3>{t("尚未建立工作紙","No worksheets yet")}</h3></div>:worksheets.map((w:Worksheet)=><div className="table-row" key={w.id}><div><b>{t(w.titleZh,w.titleEn)}</b><small>{w.questions.length} {t("題","questions")} · {w.classIds.join(", ")}</small></div><span>{w.status==="published"?t("已發布","Published"):t("草稿","Draft")}</span><div className="row-actions"><button className="outline small" onClick={()=>setPreview(w)}>👁 {t("預覽","Preview")}</button><button className="outline small" onClick={()=>setEditing(w)}><Edit3 size={14}/>{t("修改","Edit")}</button>{w.status==="draft"&&<button className="primary small" onClick={()=>publish(w)}><Check size={14}/>{t("發布","Publish")}</button>}<button className="outline small danger" onClick={()=>deleteWs(w.id)}><Trash2 size={14}/>{t("刪除","Delete")}</button></div></div>)}</div>{editing&&<WorksheetEditModal worksheet={editing} classes={classes} t={t} onSave={save} onClose={()=>setEditing(null)}/>} {preview&&<WorksheetPreviewModal worksheet={preview} t={t} onClose={()=>setPreview(null)}/>}</>;
+  return <><PageTitle title={t("工作紙管理","Worksheet Management")} sub={t("建立、修改、預覽、刪除及發布工作紙。AI 只是其中一個建立入口。","Create, edit, preview, delete and publish worksheets. AI is only one creation method.")} action={<button className="primary" onClick={()=>setPreview(null)}>{t("工作紙管理已獨立於 AI","Worksheet management is independent from AI")}</button>}/><div className="builder-card"><h2>{t("📋 直接貼上工作紙","📋 Paste an Existing Worksheet")}</h2><p className="muted">{t("格式：[第1題]、題型、題目、A-D、答案。填充題答案可用「；」分隔；短答題不需答案。","Format: [Question 1], type, question, A-D and answer. Fill-in accepted answers can be separated by semicolons; short answer needs no fixed answer.")}</p><textarea className="source-textarea" value={paste} onChange={e=>setPaste(e.target.value)} placeholder={"[第1題]\n題型：選擇題\n題目：三原色包括哪三種顏色？\n英文題目：Which are the primary colours?\nA. 紅、黃、藍\nB. 紅、綠、藍\nC. 紅、橙、紫\nD. 黃、綠、紫\n答案：A"}/><button className="primary" onClick={importText}><Clipboard size={16}/>{t("辨識並建立工作紙","Parse & Create Worksheet")}</button></div><div className="table-card">{worksheets.length===0?<div className="empty"><h3>{t("尚未建立工作紙","No worksheets yet")}</h3></div>:worksheets.map((w:Worksheet)=><div className="table-row" key={w.id}><div><b>{t(w.titleZh,w.titleEn)}</b><small>{w.questions.length} {t("題","questions")} · {w.status==="published"?`${(w.studentIds?.length||0)} ${t("位學生","students")}`:w.classIds.join(", ")}</small></div><span>{w.status==="published"?t("已發布","Published"):t("草稿","Draft")}</span><div className="row-actions"><button className="outline small" onClick={()=>setPreview(w)}>👁 {t("預覽","Preview")}</button><button className="outline small" onClick={()=>setEditing(w)}><Edit3 size={14}/>{t("修改","Edit")}</button><button className="primary small" onClick={()=>setPublishing(w)}><Check size={14}/>{w.status==="published"?t("重新發布","Republish"):t("發布","Publish")}</button><button className="outline small danger" onClick={()=>deleteWs(w.id)}><Trash2 size={14}/>{t("刪除","Delete")}</button></div></div>)}</div>{editing&&<WorksheetEditModal worksheet={editing} classes={classes} t={t} onSave={save} onClose={()=>setEditing(null)}/>} {preview&&<WorksheetPreviewModal worksheet={preview} t={t} onClose={()=>setPreview(null)}/>} {publishing&&<PublishWorksheetModal worksheet={publishing} classes={classes} students={students} t={t} onPublish={(ids:string[])=>publish(publishing,ids)} onClose={()=>setPublishing(null)}/>}</>;
 }
 function WorksheetEditModal({worksheet,classes,t,onSave,onClose}:any){
   const [w,setW]=useState<Worksheet>(JSON.parse(JSON.stringify(worksheet)));
@@ -577,18 +820,113 @@ function WorksheetEditModal({worksheet,classes,t,onSave,onClose}:any){
   const remove=(id:string)=>setW({...w,questions:rebalanceTo100(w.questions.filter(q=>q.id!==id))});
   const add=()=>setW({...w,questions:rebalanceTo100([...w.questions,{id:`q-${Date.now()}`,type:"short",question:"",points:1}])});
   const setOpt=(q:WorksheetQuestion,label:string,value:string)=>patch(q.id,{options:(q.options||[]).map(o=>o.label===label?{...o,zh:value}:o)});
-  return <Modal title={t("修改工作紙","Edit Worksheet")} onClose={onClose}><div className="review-modal-content"><label>{t("中文標題","Chinese Title")}</label><input value={w.titleZh} onChange={e=>setW({...w,titleZh:e.target.value})}/><label>{t("英文標題","English Title")}</label><input value={w.titleEn} onChange={e=>setW({...w,titleEn:e.target.value})}/>{w.questions.map((q,i)=><div className="worksheet-question" key={q.id}><div className="question-head"><b>{i+1}. {q.type}</b><button className="outline small danger" onClick={()=>remove(q.id)}><Trash2 size={14}/>{t("刪除","Delete")}</button></div><textarea value={q.question} onChange={e=>patch(q.id,{question:e.target.value})}/><input value={q.questionEn||""} onChange={e=>patch(q.id,{questionEn:e.target.value})} placeholder="English question (optional)"/>{q.options?.map(o=><div className="option-editor" key={o.label}><b>{o.label}</b><input value={o.zh} onChange={e=>setOpt(q,o.label,e.target.value)}/><input value={o.en||""} onChange={e=>patch(q.id,{options:(q.options||[]).map(x=>x.label===o.label?{...x,en:e.target.value}:x)})} placeholder="English"/></div>)}{q.type==="mc"&&<label>{t("正確答案","Correct Answer")}<select value={String(q.answer||"")} onChange={e=>patch(q.id,{answer:e.target.value})}>{(q.options||[]).map(o=><option key={o.label}>{o.label}</option>)}</select></label>}{q.type==="fill"&&<label>{t("答案（可填多個接受答案）","Accepted answers") }<input value={(q.acceptedAnswers||[]).join("; ")} onChange={e=>patch(q.id,{acceptedAnswers:e.target.value.split(/[;；,，]/).map(x=>x.trim()).filter(Boolean),answer:e.target.value.split(/[;；,，]/)[0]?.trim()})}/></label>}{q.type==="short"&&<p className="muted">{t("短答題提交後由老師批改。","Short answers are reviewed by the teacher.")}</p>}<label>{t("分值","Points")}<input type="number" min={1} value={q.points} onChange={e=>patch(q.id,{points:Number(e.target.value)||1})}/></label></div>)}<button className="outline" onClick={add}><Plus size={15}/>{t("新增題目","Add Question")}</button><div className="modal-actions"><button className="outline" onClick={onClose}>{t("取消","Cancel")}</button><button className="primary" onClick={()=>onSave({...w,questions:rebalanceTo100(w.questions)})}>{t("儲存修改","Save Changes")}</button></div></div></Modal>;
+  const chooseImage=(e:any)=>{const f=e.target.files?.[0];if(!f)return;const r=new FileReader();r.onload=()=>setW({...w,sourceImage:String(r.result),sourceImageName:f.name});r.readAsDataURL(f)};
+  return <Modal title={t("修改工作紙","Edit Worksheet")} onClose={onClose}><div className="review-modal-content"><label>{t("中文標題","Chinese Title")}</label><input value={w.titleZh} onChange={e=>setW({...w,titleZh:e.target.value})}/><label>{t("英文標題","English Title")}</label><input value={w.titleEn} onChange={e=>setW({...w,titleEn:e.target.value})}/>
+    <label>{t("開始圖片（顯示在工作紙最前面，學生作答前會看到）","Cover Image (shown at the start of the worksheet, before students answer)")}</label>
+    {w.sourceImage?<><img className="worksheet-source-image" src={w.sourceImage}/><div className="image-file-row"><span>{w.sourceImageName||t("已上傳圖片","Image uploaded")}</span><button className="outline small danger" onClick={()=>setW({...w,sourceImage:undefined,sourceImageName:undefined})}><Trash2 size={14}/>{t("移除圖片","Remove Image")}</button></div></>:
+    <label className="worksheet-image-dropzone dropzone"><input type="file" accept="image/*" onChange={chooseImage}/><Upload size={30}/><b>{t("上載開始圖片（選填）","Upload a cover image (optional)")}</b><span className="muted">{t("例如題目相關的圖片或參考作品","e.g. a reference image related to the questions")}</span></label>}
+    {w.questions.map((q,i)=><div className="worksheet-question" key={q.id}><div className="question-head"><b>{i+1}. {q.type}</b><button className="outline small danger" onClick={()=>remove(q.id)}><Trash2 size={14}/>{t("刪除","Delete")}</button></div><textarea value={q.question} onChange={e=>patch(q.id,{question:e.target.value})}/><input value={q.questionEn||""} onChange={e=>patch(q.id,{questionEn:e.target.value})} placeholder="English question (optional)"/>{q.options?.map(o=><div className="option-editor" key={o.label}><b>{o.label}</b><input value={o.zh} onChange={e=>setOpt(q,o.label,e.target.value)}/><input value={o.en||""} onChange={e=>patch(q.id,{options:(q.options||[]).map(x=>x.label===o.label?{...x,en:e.target.value}:x)})} placeholder="English"/></div>)}{q.type==="mc"&&<label>{t("正確答案","Correct Answer")}<select value={String(q.answer||"")} onChange={e=>patch(q.id,{answer:e.target.value})}>{(q.options||[]).map(o=><option key={o.label}>{o.label}</option>)}</select></label>}{q.type==="fill"&&<label>{t("答案（可填多個接受答案）","Accepted answers") }<input value={(q.acceptedAnswers||[]).join("; ")} onChange={e=>patch(q.id,{acceptedAnswers:e.target.value.split(/[;；,，]/).map(x=>x.trim()).filter(Boolean),answer:e.target.value.split(/[;；,，]/)[0]?.trim()})}/></label>}{q.type==="short"&&<p className="muted">{t("短答題提交後由老師批改。","Short answers are reviewed by the teacher.")}</p>}<label>{t("分值","Points")}<input type="number" min={1} value={q.points} onChange={e=>patch(q.id,{points:Number(e.target.value)||1})}/></label></div>)}<button className="outline" onClick={add}><Plus size={15}/>{t("新增題目","Add Question")}</button><div className="modal-actions"><button className="outline" onClick={onClose}>{t("取消","Cancel")}</button><button className="primary" onClick={()=>onSave({...w,questions:rebalanceTo100(w.questions)})}>{t("儲存修改","Save Changes")}</button></div></div></Modal>;
 }
 
-function WorksheetPreviewModal({worksheet,t,onClose}:any){return <Modal title={t(worksheet.titleZh,worksheet.titleEn)} onClose={onClose}><div className="review-modal-content">{worksheet.questions.map((q:WorksheetQuestion,i:number)=><div className="worksheet-question" key={q.id}><div className="question-head"><b>{i+1}. {q.type}</b><span>{q.points} {t("分","pts")}</span></div><h3>{q.question}</h3>{q.questionEn&&<p className="muted">{q.questionEn}</p>}{q.options?.map(o=><div key={o.label} className="preview-option"><b>{o.label}.</b> {o.zh}{o.en?` / ${o.en}`:""}</div>)}{q.type==="fill"&&<p>________________________</p>}{q.type==="short"&&<div className="short-lines">________________________________________<br/>________________________________________</div>}</div>)}</div></Modal>}
+function WorksheetPreviewModal({worksheet,t,onClose}:any){return <Modal title={t(worksheet.titleZh,worksheet.titleEn)} onClose={onClose}><div className="review-modal-content">{worksheet.sourceImage&&<img className="worksheet-source-image" src={worksheet.sourceImage} alt=""/>}{worksheet.questions.map((q:WorksheetQuestion,i:number)=><div className="worksheet-question" key={q.id}><div className="question-head"><b>{i+1}. {q.type}</b><span>{q.points} {t("分","pts")}</span></div><h3>{q.question}</h3>{q.questionEn&&<p className="muted">{q.questionEn}</p>}{q.options?.map(o=><div key={o.label} className="preview-option"><b>{o.label}.</b> {o.zh}{o.en?` / ${o.en}`:""}</div>)}{q.type==="fill"&&<p>________________________</p>}{q.type==="short"&&<div className="short-lines">________________________________________<br/>________________________________________</div>}</div>)}</div></Modal>}
+
+function PublishWorksheetModal({worksheet,classes,students,t,onPublish,onClose}:any){
+  const initial=worksheet.studentIds?.length?worksheet.studentIds:students.filter((s:Student)=>worksheet.classIds.includes(s.classId)&&s.status!=="withdrawn").map((s:Student)=>s.id);
+  const [selected,setSelected]=useState<Set<string>>(new Set(initial));
+  const [activeClass,setActiveClass]=useState(worksheet.classIds[0]||classes[0]?.id||"");
+  const toggle=(id:string)=>setSelected(prev=>{const next=new Set(prev);next.has(id)?next.delete(id):next.add(id);return next});
+  const classRoster=(cid:string)=>students.filter((s:Student)=>s.classId===cid&&s.status!=="withdrawn").sort((a:Student,b:Student)=>Number(a.number)-Number(b.number));
+  const selectAllInClass=(cid:string)=>setSelected(prev=>{const next=new Set(prev);classRoster(cid).forEach((s:Student)=>next.add(s.id));return next});
+  const clearClass=(cid:string)=>setSelected(prev=>{const next=new Set(prev);classRoster(cid).forEach((s:Student)=>next.delete(s.id));return next});
+  const confirm=()=>{if(!selected.size){alert(t("請至少選擇一位學生。","Please select at least one student."));return;}onPublish(Array.from(selected));};
+  return <Modal title={t("發布給指定學生","Publish to Selected Students")} onClose={onClose}>
+    <p className="muted">{t("選擇班別以瀏覽學生名單，勾選的學生才會收到這份工作紙。","Pick a class to browse its roster. Only checked students will receive this worksheet.")}</p>
+    <div className="class-tabs">{classes.map((c:ClassItem)=><button key={c.id} className={activeClass===c.id?"selected":""} onClick={()=>setActiveClass(c.id)}>{c.id}<small>{classRoster(c.id).filter((s:Student)=>selected.has(s.id)).length}/{classRoster(c.id).length}</small></button>)}</div>
+    <div className="publish-toolbar"><button className="outline small" onClick={()=>selectAllInClass(activeClass)}>{t("本班全選","Select all in class")}</button><button className="outline small" onClick={()=>clearClass(activeClass)}>{t("本班取消","Deselect class")}</button><span className="publish-count">{t(`已選 ${selected.size} 位學生`,`${selected.size} student(s) selected`)}</span></div>
+    <div className="publish-student-list">{classRoster(activeClass).map((s:Student)=><label className="publish-student-row" key={s.id}><input type="checkbox" checked={selected.has(s.id)} onChange={()=>toggle(s.id)}/><span>{s.name}</span><small>No.{s.number}</small></label>)}{!classRoster(activeClass).length&&<p className="muted">{t("這個班別沒有學生。","No students in this class.")}</p>}</div>
+    <div className="modal-actions"><button className="outline" onClick={onClose}>{t("取消","Cancel")}</button><button className="primary" onClick={confirm}><Check size={16}/>{t("發布","Publish")}</button></div>
+  </Modal>;
+}
 
 function WorksheetBuilder({worksheets,setWorksheets,classes,t}:any){
   const [source,setSource]=useState("");const [titleZh,setTitleZh]=useState("");const [titleEn,setTitleEn]=useState("");const [count,setCount]=useState(10);const [loading,setLoading]=useState(false);const [error,setError]=useState("");
-  const generate=async()=>{if(!source.trim()){setError(t("請先貼上教材。","Please paste teaching material first."));return;}setLoading(true);setError("");try{const batches=[];for(let i=0;i<count;i+=5){const n=Math.min(5,count-i);const ctrl=new AbortController();const timer=setTimeout(()=>ctrl.abort(),45000);try{const res=await fetch(`${AI_WORKER_URL}/worksheet`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({content:source,count:n}),signal:ctrl.signal});const payload=await res.json();if(!res.ok||!payload.success)throw new Error(payload.error||"AI generation failed");batches.push(...(payload.data?.questions||[]));}finally{clearTimeout(timer);}}const qs=rebalanceTo100(normalizeWorksheetQuestions(batches));if(qs.length<count)throw new Error(t(`AI 只生成了 ${qs.length} 題，請再試一次。`,`AI generated only ${qs.length} questions. Please try again.`));const w:Worksheet={id:`ws-${Date.now()}`,titleZh:titleZh||t("AI 工作紙","AI Worksheet"),titleEn:titleEn||"AI Worksheet",classIds:classes.slice(0,1).map((c:ClassItem)=>c.id),dueDate:new Date().toISOString().slice(0,10),questions:qs.slice(0,count),status:"draft",createdAt:now()};setWorksheets([w,...worksheets]);alert(t("AI 已建立工作紙草稿。請到「工作紙管理」修改及預覽。","AI created a worksheet draft. Open Worksheet Management to edit and preview."));setSource("");setTitleZh("");setTitleEn("");}catch(e){setError(e instanceof Error?e.message:t("AI 生成失敗。","AI generation failed."));}finally{setLoading(false);}};
+  const generate=async()=>{if(!source.trim()){setError(t("請先貼上教材。","Please paste teaching material first."));return;}setLoading(true);setError("");try{const batches=[];for(let i=0;i<count;i+=5){const n=Math.min(5,count-i);const ctrl=new AbortController();const timer=setTimeout(()=>ctrl.abort(),45000);try{const res=await fetch(`${AI_WORKER_URL}/worksheet`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({content:source,count:n}),signal:ctrl.signal});const payload=await res.json();if(!res.ok||!payload.success)throw new Error(payload.error||"AI generation failed");batches.push(...(payload.data?.questions||[]));}finally{clearTimeout(timer);}}const qs=rebalanceTo100(batches);if(qs.length<count)throw new Error(t(`AI 只生成了 ${qs.length} 題，請再試一次。`,`AI generated only ${qs.length} questions. Please try again.`));const w:Worksheet={id:`ws-${Date.now()}`,titleZh:titleZh||t("AI 工作紙","AI Worksheet"),titleEn:titleEn||"AI Worksheet",classIds:classes.slice(0,1).map((c:ClassItem)=>c.id),dueDate:new Date().toISOString().slice(0,10),questions:qs.slice(0,count),status:"draft",createdAt:now()};setWorksheets([w,...worksheets]);alert(t("AI 已建立工作紙草稿。請到「工作紙管理」修改及預覽。","AI created a worksheet draft. Open Worksheet Management to edit and preview."));setSource("");setTitleZh("");setTitleEn("");}catch(e){setError(e instanceof Error?e.message:t("AI 生成失敗。","AI generation failed."));}finally{setLoading(false);}};
   return <><PageTitle title={t("AI 建立工作紙","AI Worksheet")} sub={t("AI 只是輔助工具。生成後請到工作紙管理修改、預覽及發布。","AI is only an assistant. Edit, preview and publish from Worksheet Management after generation.")}/><div className="builder-card"><label>{t("中文標題","Chinese Title")}</label><input value={titleZh} onChange={e=>setTitleZh(e.target.value)}/><label>{t("英文標題","English Title")}</label><input value={titleEn} onChange={e=>setTitleEn(e.target.value)}/><label>{t("題目數量","Number of Questions")}</label><select value={count} onChange={e=>setCount(Number(e.target.value))}><option value={10}>10</option><option value={15}>15</option><option value={20}>20</option></select><label>{t("教材內容","Teaching Material")}</label><textarea className="source-textarea" value={source} onChange={e=>setSource(e.target.value)} placeholder={t("貼上教材內容…","Paste teaching material…")}/>{error&&<div className="warning">{error}</div>}<div className="builder-actions"><button className="primary" disabled={loading||!source.trim()} onClick={generate}>{loading?t("AI 生成中…每批最多 45 秒","Generating… max 45s per batch"):t("生成工作紙草稿","Generate Draft")}</button></div><p className="muted">{t("AI 頁面獨立於工作紙管理；即使 AI 很慢，你仍可正常管理、查看及修改已有工作紙。","AI is separate from worksheet management, so slow AI never blocks your existing worksheets.")}</p></div></>;
 }
 
 function GradesView({students,classes,topics,subs,t,topicName}:any){
+  // 1. 計算個別學生作品的分數（相容工作紙與一般評核）
+const getSubmissionScore = (sub: Submission) => {
+  if (sub.autoScore !== undefined) return sub.autoScore;
+  if (sub.marks && sub.marks.length) return sub.marks.reduce((a, b) => a + b, 0);
+  return 0;
+};
+
+// 2. 計算某個班別的全班平均分
+const calculateClassAverage = (classId: string) => {
+  const classStudents = students.filter(s => s.classId === classId && s.status !== "withdrawn");
+  const studentIds = classStudents.map(s => s.id);
+  
+  // 找出該班學生的所有最新提交紀錄
+  const validSubs = subs.filter(s => studentIds.includes(s.studentId) && (s.marks?.length || s.autoScore !== undefined));
+  
+  if (!validSubs.length) return "—";
+  
+  const totalScore = validSubs.reduce((acc, sub) => acc + getSubmissionScore(sub), 0);
+  return (totalScore / validSubs.length).toFixed(1);
+};
+
+// 3. 匯出 Excel (CSV) 檔案（內建 UTF-8 防亂碼處理）
+const handleExportCSV = (selectedClassId: string) => {
+  const classStudents = students.filter(s => s.classId === selectedClassId && s.status !== "withdrawn");
+  const classTopics = topics.filter(t => t.classIds.includes(selectedClassId));
+
+  // CSV 標頭：班別, 學號, 姓名, 課題1, 課題2..., 個人平均分
+  let csvContent = "\uFEFF班別,學號,姓名," + classTopics.map(t => `"${t.nameZh}"`).join(",") + ",個人平均分\n";
+
+  let classTotalScore = 0;
+  let classSubCount = 0;
+
+  classStudents.forEach(s => {
+    let studentSum = 0;
+    let studentCount = 0;
+
+    const rowScores = classTopics.map(t => {
+      const sub = subs
+        .filter(x => x.studentId === s.id && x.topicId === t.id)
+        .sort((a, b) => b.version - a.version)[0];
+
+      if (!sub) return "未交";
+
+      const score = getSubmissionScore(sub);
+      studentSum += score;
+      studentCount++;
+      return score;
+    });
+
+    const studentAvg = studentCount > 0 ? (studentSum / studentCount).toFixed(1) : "—";
+    if (studentCount > 0) {
+      classTotalScore += studentSum;
+      classSubCount += studentCount;
+    }
+
+    csvContent += `"${s.classId}","${s.number}","${s.name}",` + rowScores.join(",") + `,"${studentAvg}"\n`;
+  });
+
+  // 底部新增：全班總平均分
+  const classAvg = classSubCount > 0 ? (classTotalScore / classSubCount).toFixed(1) : "—";
+  csvContent += `全班平均分,,,` + classTopics.map(() => "").join(",") + `,"${classAvg}"\n`;
+
+  // 觸發瀏覽器下載檔案
+  const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.setAttribute("download", `${selectedClassId}_班級視覺藝術成績表.csv`);
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+};
   const [classId,setClassId]=useState(classes[0]?.id||"2A"); const [topicId,setTopicId]=useState(topics[0]?.id||"");
   const list=students.filter((s:Student)=>s.classId===classId).sort((a:Student,b:Student)=>Number(a.number)-Number(b.number));
   const rows=list.map((s:Student)=>{const ss=subs.filter((q:Submission)=>q.studentId===s.id&&q.topicId===topicId&&q.status==="assessed");const marks=ss.flatMap((q:Submission)=>q.marks||[]);return {s,total:marks.length?marks.reduce((a,b)=>a+b,0):null}});
@@ -599,3 +937,24 @@ function GradesView({students,classes,topics,subs,t,topicName}:any){
 function Status({status,t}:{status:StudentStatus;t:any}){return <span className={`status-pill ${status}`}>{status==="active"?"🟢 "+t("正常上課","Active"):status==="longAbsence"?"🟡 "+t("暫時長期缺席","Long Absence"):"⚫ "+t("畢業／離校","Graduated / Withdrawn")}</span>}
 function PageTitle({title,sub,action}:any){return <div className="page-title"><div><h1>{title}</h1>{sub&&<p>{sub}</p>}</div>{action&&<div className="page-action">{action}</div>}</div>}
 function Modal({title,onClose,children}:any){return <div className="modal-backdrop"><div className="modal"><div className="modal-head"><h2>{title}</h2><button className="icon-btn" onClick={onClose}><X size={17}/></button></div>{children}</div></div>}
+<div className="class-settings-bar">
+  <div>
+    <h3>{selectedClassId} 班成績總覽</h3>
+    <span>全班人數：{students.filter(s => s.classId === selectedClassId && s.status !== "withdrawn").length} 人</span>
+  </div>
+
+  <div style={{ display: "flex", gap: "16px", alignItems: "center" }}>
+    {/* 全班平均分顯示卡片 */}
+    <div style={{ background: "#f5efff", padding: "8px 16px", borderRadius: "10px", border: "1px solid #d8b4fe" }}>
+      <small style={{ color: "#6b21a8", fontWeight: "bold" }}>全班平均分</small>
+      <div style={{ fontSize: "22px", fontWeight: "800", color: "#581c87" }}>
+        {calculateClassAverage(selectedClassId)} <span style={{ fontSize: "13px" }}>分</span>
+      </div>
+    </div>
+
+    {/* 匯出 CSV 成績單按鈕 */}
+    <button className="primary" onClick={() => handleExportCSV(selectedClassId)}>
+      📥 匯出 {selectedClassId} 班 CSV 成績表
+    </button>
+  </div>
+</div>
